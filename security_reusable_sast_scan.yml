@@ -1,0 +1,158 @@
+name: Reusable Security SAST scan (Detect vulnerabilities)
+
+on:
+  workflow_call:
+
+jobs:
+  semgrep:
+    runs-on: windows-latest
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: 🧪 List files 1
+        shell: pwsh
+        run: Get-ChildItem -Force
+
+      - name: 📥 Checkout du code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install semgrep and dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+          semgrep --version
+
+      - name: 📦 Install jq (for JSON/SARIF processing)
+        shell: pwsh
+        run: |
+          choco install jq -y
+          jq --version
+
+      - name: 🧪 List files 2
+        shell: pwsh
+        run: Get-ChildItem -Force
+
+      - name: 🆔 Generate unique and random string for unique file naming
+        shell: pwsh
+        run: |
+          $chars = (48..57) + (65..90) + (97..122)
+          $UNIQ = -join (1..30 | ForEach-Object { [char]($chars | Get-Random) })
+          "UNIQ_STR=$UNIQ" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 🫙 Store Perso Git URL in environment variable
+        shell: pwsh
+        run: |
+          "PERSO_GIT=https://github.com/Naim-Aouaichia/" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 🚀🪲 Run semgrep for scan low vulnerabilities levels and add severity result in report
+        shell: pwsh
+        run: |
+          semgrep --config=auto . `
+            --sarif --sarif-output="output-$env:UNIQ_STR-info.json" --severity=INFO
+
+          jq '.runs[].results[] |= (.properties["security-severity"] = "1.0")' `
+            "output-$env:UNIQ_STR-info.json" > "output-$env:UNIQ_STR-info.sarif"
+
+      - name: 🚀🪲🪲 Run semgrep for scan medium vulnerabilities levels and add severity result in report
+        shell: pwsh
+        run: |
+          semgrep --config=auto . `
+            --sarif --sarif-output="output-$env:UNIQ_STR-warning.json" --severity=WARNING
+
+          jq '.runs[].results[] |= (.properties["security-severity"] = "5.0")' `
+            "output-$env:UNIQ_STR-warning.json" > "output-$env:UNIQ_STR-warning.sarif"
+
+      - name: 🚀🪲🪲🪲 Run semgrep for scan high vulnerabilities levels and add severity result in report
+        shell: pwsh
+        run: |
+          semgrep --config=auto . `
+            --sarif --sarif-output="output-$env:UNIQ_STR-error.json" --severity=ERROR
+
+          jq '.runs[].results[] |= (.properties["security-severity"] = "7.0")' `
+            "output-$env:UNIQ_STR-error.json" > "output-$env:UNIQ_STR-error.sarif"
+
+      - name: 🔗 Aggregate result in semgrep-report-temp.sarif
+        shell: pwsh
+        run: |
+          jq -s '{
+            version: (.[0].version),
+            runs: [
+              {
+                invocations: (map(.runs[].invocations) | add),
+                results: (map(.runs[].results) | add),
+                tool: {
+                  driver: {
+                    name: (.[0].runs[0].tool.driver.name),
+                    rules: (map(.runs[].tool.driver.rules) | add),
+                    semanticVersion: (.[0].runs[0].tool.driver.semanticVersion)
+                  }
+                }
+              }
+            ],
+            "$schema": (.[0]."$schema")
+          }' "output-$env:UNIQ_STR-"*.sarif > semgrep-report-temp.sarif
+
+      - name: 💾 Format sarif file as required
+        id: report_prep
+        shell: pwsh
+        run: |
+          Write-Host "********* Change driver name"
+          jq '.runs[0].tool.driver.name = "Semgrep"' semgrep-report-temp.sarif > semgrep-report-temp-temp.sarif
+
+          Write-Host "********* Set right severity code for GHAS"
+          jq '.runs[0].tool.driver.rules |= map(
+            if .defaultConfiguration.level == "note" then .properties.severity = "MEDIUM"
+            elif .defaultConfiguration.level == "warning" then .properties.severity = "HIGH"
+            elif .defaultConfiguration.level == "error" then .properties.severity = "CRITICAL"
+            else . end
+          )' semgrep-report-temp-temp.sarif > semgrep-report-temp.sarif
+
+          Write-Host "********* Delete old severity code, avoiding polluting vuln reports with bad code"
+          jq '.runs[0].tool.driver.rules |= map(
+            del(.defaultConfiguration)
+          )' semgrep-report-temp.sarif > semgrep-report.sarif
+
+          Write-Host "********* Prepare security tab code scanning link"
+          $tab = "$env:PERSO_GIT$($env:GITHUB_REPOSITORY.Split('/')[1])/security/code-scanning"
+          "tab_security_github=$tab" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: ⬆️ Upload Semgrep file as SARIF to GitHub Advanced Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-report.sarif
+          category: semgrep-sast-analysis
+          checkout_path: .
+          ref: ${{ github.ref }}
+          sha: ${{ github.sha }}
+
+      - name: 🔄 Count and store vuln
+        shell: pwsh
+        run: |
+          jq '.runs[0].results | length' semgrep-report.sarif | Out-File -FilePath vuln_count.txt -Encoding utf8
+          $VULN_COUNT = Get-Content vuln_count.txt
+          Write-Host "Nombre de vulnérabilités détectées : $VULN_COUNT"
+          "VULN_COUNT=$VULN_COUNT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: 🧪 List files 3
+        shell: pwsh
+        run: Get-ChildItem -Force
+
+      - name: ✅ Vérification du résultat de l’analyse
+        shell: pwsh
+        run: |
+          if ([int]$env:VULN_COUNT -gt 0) {
+            Write-Error "❌ $($env:VULN_COUNT) vulnérabilités détectées. CI bloquée."
+            exit 1
+          } else {
+            Write-Host "✅ Aucune vulnérabilité détectée. CI validée."
+          }
